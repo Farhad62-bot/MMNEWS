@@ -31,6 +31,11 @@ app = Flask(__name__)
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 CHECK_WINDOW_MINUTES = int(os.environ.get("CHECK_WINDOW_MINUTES", "15"))
+# How far ahead of a red-folder event to send the "coming up" heads-up alert.
+ADVANCE_WARNING_MINUTES = int(os.environ.get("ADVANCE_WARNING_MINUTES", "60"))
+# Your local UTC offset, so "start of day" / "end of day" match YOUR day,
+# not UTC's. E.g. Gulf Standard Time (UAE) is UTC+4, so set this to 4.
+TIMEZONE_OFFSET_HOURS = float(os.environ.get("TIMEZONE_OFFSET_HOURS", "4"))
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -77,6 +82,9 @@ CRITICAL_WAR_KEYWORDS = [
 _sent_cache = {}
 CACHE_TTL_MINUTES = 180
 
+# Tracks the last local calendar date we ran the daily pin-reset/digest for.
+_last_reset_date = None
+
 
 def already_sent(key):
     now = time.time()
@@ -87,6 +95,11 @@ def already_sent(key):
         return True
     _sent_cache[key] = now
     return False
+
+
+def to_local(dt_utc):
+    """Convert a UTC datetime to your local time using TIMEZONE_OFFSET_HOURS."""
+    return dt_utc + timedelta(hours=TIMEZONE_OFFSET_HOURS)
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +133,68 @@ def send_telegram_message(text, pin=False):
         )
     return data
 
+def unpin_all_messages():
+    if not BOT_TOKEN or not CHAT_ID:
+        return None
+    return requests.post(
+        f"{TELEGRAM_API}/unpinAllChatMessages",
+        data={"chat_id": CHAT_ID},
+        timeout=15,
+    ).json()
+
 
 # ---------------------------------------------------------------------------
 # News checking
 # ---------------------------------------------------------------------------
+def fetch_ff_events():
+    try:
+        resp = requests.get(FOREX_FACTORY_JSON, timeout=15)
+        return resp.json()
+    except Exception as e:
+        print(f"Failed to fetch forex factory calendar: {e}")
+        return []
+
+
+def maybe_run_daily_reset(events):
+    """
+    Once per local calendar day: unpin everything from the previous day,
+    then pin a single digest listing every red-folder event coming up today.
+    Returns True if it just ran the reset (useful for the /run-check response).
+    """
+    global _last_reset_date
+    now_local = to_local(datetime.now(timezone.utc))
+    today = now_local.date()
+
+    if _last_reset_date == today:
+        return False
+    _last_reset_date = today
+
+    unpin_all_messages()
+
+    todays_high_impact = []
+    for event in events:
+        if event.get("impact") != "High":
+            continue
+        try:
+            event_time_utc = datetime.fromisoformat(event["date"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+        event_time_local = to_local(event_time_utc)
+        if event_time_local.date() == today:
+            todays_high_impact.append((event_time_local, event.get("country", ""), event.get("title", "Unknown Event")))
+
+    todays_high_impact.sort(key=lambda row: row[0])
+
+    if todays_high_impact:
+        lines = "\n".join(f"{t.strftime('%H:%M')} — {c}: {ti}" for t, c, ti in todays_high_impact)
+        digest = f"📅 <b>TODAY'S RED FOLDER EVENTS</b>\n{lines}"
+    else:
+        digest = "📅 <b>TODAY'S RED FOLDER EVENTS</b>\nNo high-impact events scheduled today."
+
+    send_telegram_message(digest, pin=True)
+    return True
+
+
 def entry_recent(published_struct, window_minutes):
     if not published_struct:
         return False
@@ -164,15 +235,8 @@ def check_rss_feeds(feeds, keywords, critical_keywords=None, label=""):
     return messages
 
 
-def check_forex_factory():
+def check_forex_factory(events):
     messages = []
-    try:
-        resp = requests.get(FOREX_FACTORY_JSON, timeout=15)
-        events = resp.json()
-    except Exception as e:
-        print(f"Failed to fetch forex factory calendar: {e}")
-        return messages
-
     now = datetime.now(timezone.utc)
     for event in events:
         if event.get("impact") != "High":
@@ -182,24 +246,38 @@ def check_forex_factory():
         except Exception:
             continue
 
-        # Only alert once the event has just been released (within the
-        # check window), so it fires roughly once per real release.
-        if timedelta(0) <= now - event_time <= timedelta(minutes=CHECK_WINDOW_MINUTES):
-            title = event.get("title", "Unknown Event")
-            country = event.get("country", "")
-            dedupe_key = hashlib.md5(f"{title}{country}{event_time}".encode("utf-8")).hexdigest()
-            if already_sent(dedupe_key):
-                continue
+        title = event.get("title", "Unknown Event")
+        country = event.get("country", "")
+        minutes_until = (event_time - now).total_seconds() / 60
 
-            actual = event.get("actual") or "N/A"
-            forecast = event.get("forecast") or "N/A"
-            previous = event.get("previous") or "N/A"
-            msg = (
-                "🔴 <b>RED FOLDER — HIGH IMPACT</b>\n"
-                f"{country}: {title}\n"
-                f"Actual: {actual} | Forecast: {forecast} | Previous: {previous}"
-            )
-            messages.append((msg, True))
+        # 1) HEADS-UP, before it happens — this is the one that mirrors
+        #    what you see coming up on the ForexFactory calendar page.
+        if 0 < minutes_until <= ADVANCE_WARNING_MINUTES:
+            dedupe_key = hashlib.md5(f"warn-{title}{country}{event_time}".encode("utf-8")).hexdigest()
+            if not already_sent(dedupe_key):
+                forecast = event.get("forecast") or "N/A"
+                previous = event.get("previous") or "N/A"
+                msg = (
+                    "🔔 <b>RED FOLDER COMING UP — in "
+                    f"{int(round(minutes_until))} min</b>\n"
+                    f"{country}: {title}\n"
+                    f"Forecast: {forecast} | Previous: {previous}"
+                )
+                messages.append((msg, True))
+
+        # 2) RESULT, right after it's released — actual vs forecast.
+        elif timedelta(0) <= now - event_time <= timedelta(minutes=CHECK_WINDOW_MINUTES):
+            dedupe_key = hashlib.md5(f"release-{title}{country}{event_time}".encode("utf-8")).hexdigest()
+            if not already_sent(dedupe_key):
+                actual = event.get("actual") or "N/A"
+                forecast = event.get("forecast") or "N/A"
+                previous = event.get("previous") or "N/A"
+                msg = (
+                    "🔴 <b>RED FOLDER RELEASED — HIGH IMPACT</b>\n"
+                    f"{country}: {title}\n"
+                    f"Actual: {actual} | Forecast: {forecast} | Previous: {previous}"
+                )
+                messages.append((msg, True))
     return messages
 
 
@@ -208,8 +286,11 @@ def check_forex_factory():
 # ---------------------------------------------------------------------------
 @app.route("/run-check")
 def run_check():
+    ff_events = fetch_ff_events()
+    did_reset = maybe_run_daily_reset(ff_events)
+
     all_messages = []
-    all_messages += check_forex_factory()
+    all_messages += check_forex_factory(ff_events)
     all_messages += check_rss_feeds(WAR_FEEDS, WAR_KEYWORDS, CRITICAL_WAR_KEYWORDS, label="WAR")
     all_messages += check_rss_feeds(ECONOMIC_FEEDS, ECON_KEYWORDS, label="ECONOMIC")
 
@@ -219,7 +300,12 @@ def run_check():
         sent += 1
         time.sleep(1)  # be gentle with Telegram's rate limits
 
-    return jsonify({"status": "ok", "checked_at": datetime.now(timezone.utc).isoformat(), "sent": sent})
+    return jsonify({
+        "status": "ok",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "daily_reset_ran": did_reset,
+        "sent": sent,
+    })
 
 
 @app.route("/")
