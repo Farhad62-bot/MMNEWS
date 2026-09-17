@@ -17,6 +17,7 @@ run background schedulers reliably on their own, so we use this
 import os
 import time
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -85,6 +86,10 @@ CACHE_TTL_MINUTES = 180
 # Tracks the last local calendar date we ran the daily pin-reset/digest for.
 _last_reset_date = None
 
+# Keeps the last successfully fetched calendar so a single rate-limited or
+# blocked request doesn't wipe out the whole day's events.
+_cached_ff_events = None
+
 
 def already_sent(key):
     now = time.time()
@@ -109,38 +114,47 @@ def send_telegram_message(text, pin=False):
     if not BOT_TOKEN or not CHAT_ID:
         print("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID env vars")
         return None
-    resp = requests.post(
-        f"{TELEGRAM_API}/sendMessage",
-        data={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        },
-        timeout=15,
-    )
-    data = resp.json()
-    if pin and data.get("ok"):
-        message_id = data["result"]["message_id"]
-        requests.post(
-            f"{TELEGRAM_API}/pinChatMessage",
+    try:
+        resp = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
             data={
                 "chat_id": CHAT_ID,
-                "message_id": message_id,
-                "disable_notification": False,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
             },
             timeout=15,
         )
-    return data
+        data = resp.json()
+        if pin and data.get("ok"):
+            message_id = data["result"]["message_id"]
+            requests.post(
+                f"{TELEGRAM_API}/pinChatMessage",
+                data={
+                    "chat_id": CHAT_ID,
+                    "message_id": message_id,
+                    "disable_notification": False,
+                },
+                timeout=15,
+            )
+        return data
+    except Exception as e:
+        print(f"Telegram sendMessage/pin failed: {e}")
+        return None
+
 
 def unpin_all_messages():
     if not BOT_TOKEN or not CHAT_ID:
         return None
-    return requests.post(
-        f"{TELEGRAM_API}/unpinAllChatMessages",
-        data={"chat_id": CHAT_ID},
-        timeout=15,
-    ).json()
+    try:
+        return requests.post(
+            f"{TELEGRAM_API}/unpinAllChatMessages",
+            data={"chat_id": CHAT_ID},
+            timeout=15,
+        ).json()
+    except Exception as e:
+        print(f"Telegram unpinAllChatMessages failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -176,17 +190,22 @@ def fetch_ff_events():
         return [], False
 
 
-def maybe_run_daily_reset(events):
+def maybe_run_daily_reset(events, data_is_reliable):
     """
     Once per local calendar day: unpin everything from the previous day,
     then pin a single digest listing every red-folder event coming up today.
     Returns True if it just ran the reset (useful for the /run-check response).
+    Skips (and retries next check) if we don't yet have reliable calendar
+    data, so a rate-limited fetch can't lock in a wrong "no events" digest.
     """
     global _last_reset_date
     now_local = to_local(datetime.now(timezone.utc))
     today = now_local.date()
 
     if _last_reset_date == today:
+        return False
+    if not data_is_reliable:
+        print("Skipping daily reset: no reliable FF calendar data yet, will retry next check.")
         return False
     _last_reset_date = today
 
@@ -224,15 +243,31 @@ def entry_recent(published_struct, window_minutes):
     return now - timedelta(minutes=window_minutes) <= published <= now + timedelta(minutes=1)
 
 
+def _fetch_one_feed(url, headers):
+    try:
+        raw = requests.get(url, headers=headers, timeout=10)
+        return url, raw.content
+    except Exception as e:
+        print(f"Failed to fetch {url}: {e}")
+        return url, None
+
+
 def check_rss_feeds(feeds, keywords, critical_keywords=None, label=""):
     messages = []
     headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
-    for url in feeds:
+
+    # Fetch every feed at the same time instead of one after another —
+    # this is what keeps /run-check fast enough to avoid server timeouts.
+    with ThreadPoolExecutor(max_workers=max(len(feeds), 1)) as executor:
+        fetched = list(executor.map(lambda u: _fetch_one_feed(u, headers), feeds))
+
+    for url, content in fetched:
+        if content is None:
+            continue
         try:
-            raw = requests.get(url, headers=headers, timeout=15)
-            feed = feedparser.parse(raw.content)
+            feed = feedparser.parse(content)
         except Exception as e:
-            print(f"Failed to fetch/parse {url}: {e}")
+            print(f"Failed to parse {url}: {e}")
             continue
         for entry in feed.entries:
             title = entry.get("title", "")
@@ -307,8 +342,8 @@ def check_forex_factory(events):
 # ---------------------------------------------------------------------------
 @app.route("/run-check")
 def run_check():
-    ff_events = fetch_ff_events()
-    did_reset = maybe_run_daily_reset(ff_events)
+    ff_events, ff_data_reliable = fetch_ff_events()
+    did_reset = maybe_run_daily_reset(ff_events, ff_data_reliable)
 
     all_messages = []
     all_messages += check_forex_factory(ff_events)
