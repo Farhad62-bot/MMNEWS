@@ -38,6 +38,13 @@ ADVANCE_WARNING_MINUTES = int(os.environ.get("ADVANCE_WARNING_MINUTES", "60"))
 # not UTC's. E.g. Gulf Standard Time (UAE) is UTC+4, so set this to 4.
 TIMEZONE_OFFSET_HOURS = float(os.environ.get("TIMEZONE_OFFSET_HOURS", "4"))
 
+# --- ATR volatility alert (via Twelve Data's free API) ---
+TWELVE_DATA_API_KEY = os.environ.get("TWELVE_DATA_API_KEY")
+ATR_SYMBOL = os.environ.get("ATR_SYMBOL", "XAU/USD")
+ATR_INTERVAL = os.environ.get("ATR_INTERVAL", "5min")
+ATR_PERIOD = int(os.environ.get("ATR_PERIOD", "14"))
+ATR_THRESHOLD = float(os.environ.get("ATR_THRESHOLD", "7"))
+
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Public RSS feeds (no API key needed)
@@ -89,6 +96,10 @@ _last_reset_date = None
 # Keeps the last successfully fetched calendar so a single rate-limited or
 # blocked request doesn't wipe out the whole day's events.
 _cached_ff_events = None
+
+# Tracks whether the last ATR reading was already above the threshold, so we
+# alert only on the moment it crosses up — not on every check while elevated.
+_atr_was_above_threshold = False
 
 
 def already_sent(key):
@@ -337,6 +348,64 @@ def check_forex_factory(events):
     return messages
 
 
+def check_atr_alert():
+    """
+    Pulls the latest ATR value for ATR_SYMBOL/ATR_INTERVAL from Twelve
+    Data's free API and fires a pinned alert the moment it crosses above
+    ATR_THRESHOLD. Only fires once per "spike episode" — it resets once
+    the ATR drops back below the threshold, so a sustained volatile
+    stretch doesn't spam a message every single check.
+    """
+    global _atr_was_above_threshold
+    messages = []
+
+    if not TWELVE_DATA_API_KEY:
+        print("Missing TWELVE_DATA_API_KEY env var, skipping ATR check")
+        return messages
+
+    try:
+        resp = requests.get(
+            "https://api.twelvedata.com/atr",
+            params={
+                "symbol": ATR_SYMBOL,
+                "interval": ATR_INTERVAL,
+                "time_period": ATR_PERIOD,
+                "apikey": TWELVE_DATA_API_KEY,
+                "outputsize": 1,
+            },
+            timeout=15,
+        )
+        data = resp.json()
+    except Exception as e:
+        print(f"Failed to fetch ATR: {e}")
+        return messages
+
+    if data.get("status") == "error" or "values" not in data:
+        print(f"ATR API returned an error: {data}")
+        return messages
+
+    try:
+        latest = data["values"][0]
+        atr_value = float(latest["atr"])
+        candle_time = latest.get("datetime", "")
+    except Exception as e:
+        print(f"Failed to parse ATR response: {e}")
+        return messages
+
+    is_above = atr_value > ATR_THRESHOLD
+    if is_above and not _atr_was_above_threshold:
+        msg = (
+            "📈 <b>VOLATILITY SPIKE — ATR ALERT</b>\n"
+            f"{ATR_SYMBOL} {ATR_INTERVAL} ATR({ATR_PERIOD}): {atr_value:.2f} "
+            f"(above {ATR_THRESHOLD})\n"
+            f"As of candle: {candle_time}"
+        )
+        messages.append((msg, True))
+
+    _atr_was_above_threshold = is_above
+    return messages
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -349,6 +418,7 @@ def run_check():
     all_messages += check_forex_factory(ff_events)
     all_messages += check_rss_feeds(WAR_FEEDS, WAR_KEYWORDS, CRITICAL_WAR_KEYWORDS, label="WAR")
     all_messages += check_rss_feeds(ECONOMIC_FEEDS, ECON_KEYWORDS, label="ECONOMIC")
+    all_messages += check_atr_alert()
 
     sent = 0
     for msg, is_critical in all_messages:
