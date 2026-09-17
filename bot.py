@@ -147,12 +147,33 @@ def unpin_all_messages():
 # News checking
 # ---------------------------------------------------------------------------
 def fetch_ff_events():
+    """Returns (events, fetch_succeeded). fetch_succeeded is False only when
+    we got neither fresh data nor a usable cache — callers should avoid
+    locking in decisions (like the once-per-day reset) on that case."""
+    global _cached_ff_events
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
     try:
-        resp = requests.get(FOREX_FACTORY_JSON, timeout=15)
-        return resp.json()
+        resp = requests.get(FOREX_FACTORY_JSON, timeout=15, headers=headers)
+        text = resp.text.strip()
+        content_type = resp.headers.get("Content-Type", "")
+
+        # ForexFactory rate-limits this feed (2 requests / 5 min per IP).
+        # When exceeded, it returns an HTML "Request Denied" page instead
+        # of JSON — detect that instead of silently losing the day's data.
+        if "json" not in content_type.lower() and not text.startswith("["):
+            print("FF calendar returned non-JSON (likely rate-limited or blocked). Using cached data.")
+            if _cached_ff_events is not None:
+                return _cached_ff_events, True
+            return [], False
+
+        events = resp.json()
+        _cached_ff_events = events
+        return events, True
     except Exception as e:
         print(f"Failed to fetch forex factory calendar: {e}")
-        return []
+        if _cached_ff_events is not None:
+            return _cached_ff_events, True
+        return [], False
 
 
 def maybe_run_daily_reset(events):
